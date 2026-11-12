@@ -4,7 +4,13 @@ Windows 上的轻量流量悬浮窗：一张常驻小卡片显示实时上行/�
 「实时上传 / 实时下载」的进程榜（带真实进程图标）；拖到屏幕左右边缘变成贴边竖条，
 悬停会展开成完整卡片。视觉参考火绒安全的流量悬浮窗，代码、图标、采集全部自研。
 
-![screenshot](docs/screenshot.png)
+![卡片与进程榜](docs/screenshot.png)
+
+<p align="center">
+  <img src="docs/dock.png" width="76" alt="贴边竖条">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/settings.png" width="432" alt="设置面板">
+</p>
 
 ## 当前状态（检查点 4）
 
@@ -23,10 +29,13 @@ Windows 上的轻量流量悬浮窗：一张常驻小卡片显示实时上行/�
   （只统计物理网卡，避免 VPN / 虚拟网卡把同一份流量重复相加）
 - **设置面板**（右键悬浮窗/托盘 →「设置…」，或 `--settings`）：开机启动（计划任务，
   最高权限静默启动）、透明度、圆角、恢复默认，整行可点、行悬停高亮
-- 单实例：第二次启动直接退出，避免抢同一个 ETW 会话
+- 单实例：第二次启动会把 `--settings` 转发给已运行实例，然后自己退出
 - 全部 Direct2D + DirectWrite **软件渲染**（`D2D1_RENDER_TARGET_TYPE_SOFTWARE`）
 
-仍然没有的：深色主题、点击进程行的动作、历史流量统计。
+仍然没有的：点击进程行的动作、历史流量统计。
+
+> 截图里的进程名（svchost / powershell / explorer）和速率是 `FLOWDOCK_DEMO=1` 下的假数据，
+> 由 `flowdock.exe --shot <dir> [scale]` 离线渲染，不经过桌面，也不包含任何真实使用记录。
 
 ## 实测资源占用
 
