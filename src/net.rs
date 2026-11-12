@@ -24,19 +24,22 @@ pub struct Sampler {
     up: AtomicU64,
     down: AtomicU64,
     procs: Mutex<Vec<ProcSample>>,
-    pub etw_active: bool,
+    /// ETW 和网卡总量都拿不到时，面板要提示需要管理员权限
+    pub limited: bool,
 }
 
 impl Sampler {
     pub fn start() -> Arc<Sampler> {
-        let etw_ok = etw::start();
-        log(&format!("ETW session: {etw_ok}"));
+        // FLOWDOCK_DEMO=1：截图/演示用，不启动 ETW，返回固定的假数据
+        let demo = std::env::var_os("FLOWDOCK_DEMO").is_some();
+        let etw_ok = !demo && etw::start();
+        log(&format!("ETW session: {etw_ok} demo: {demo}"));
 
         let s = Arc::new(Sampler {
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
             procs: Mutex::new(Vec::new()),
-            etw_active: etw_ok,
+            limited: !etw_ok && !demo,
         });
 
         let c = s.clone();
@@ -50,6 +53,21 @@ impl Sampler {
             loop {
                 thread::sleep(Duration::from_millis(1000));
                 tick += 1;
+
+                if demo {
+                    let rows = demo_rows();
+                    let up: f64 = rows.iter().map(|r| r.up).sum();
+                    let down: f64 = rows.iter().map(|r| r.down).sum();
+                    c.up.store(up as u64, Ordering::Relaxed);
+                    c.down.store(down as u64, Ordering::Relaxed);
+                    for p in &rows {
+                        let _ = crate::icon::get(&p.path);
+                    }
+                    if let Ok(mut p) = c.procs.lock() {
+                        *p = rows;
+                    }
+                    continue;
+                }
 
                 if !etw_ok {
                     let cur = totals();
@@ -176,4 +194,29 @@ fn totals() -> (u64, u64) {
         FreeMibTable(table as *const core::ffi::c_void);
         (in_octets, out_octets)
     }
+}
+
+/// 演示数据：只用 Windows 自带进程，避免把真实在用的软件名带进截图。
+pub fn demo_rows() -> Vec<ProcSample> {
+    let kb = 1024.0;
+    vec![
+        ProcSample {
+            name: "svchost.exe".into(),
+            up: 86.4 * kb,
+            down: 3.4 * 1024.0 * kb,
+            path: r"C:\Windows\System32\svchost.exe".into(),
+        },
+        ProcSample {
+            name: "powershell.exe".into(),
+            up: 24.1 * kb,
+            down: 12.0 * kb,
+            path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
+        },
+        ProcSample {
+            name: "explorer.exe".into(),
+            up: 1.2 * kb,
+            down: 128.6 * kb,
+            path: r"C:\Windows\explorer.exe".into(),
+        },
+    ]
 }

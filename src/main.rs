@@ -139,7 +139,7 @@ impl App {
         let (up, down) = self.sampler.totals();
         let procs = self.sampler.procs();
         self.panel.target.begin();
-        ui::draw_panel(&self.panel.target, up, down, &procs, &procs, self.cfg.radius, !self.sampler.etw_active);
+        ui::draw_panel(&self.panel.target, up, down, &procs, &procs, self.cfg.radius, self.sampler.limited);
         self.panel.target.end();
         let a = (self.cfg.opacity as f32 * self.panel_alpha) as u8;
         self.panel.surface.present(self.panel.hwnd, self.panel.x, self.panel.y, a);
@@ -767,7 +767,99 @@ fn create_window(class: PCWSTR, w: i32, h: i32, x: i32, y: i32) -> Result<HWND> 
     }
 }
 
+/// 把一块分层表面按浅灰底合成后写成 BMP（截图用，不依赖桌面）。
+fn save_bmp(s: &Surface, path: &str, bg: (u8, u8, u8)) {
+    let (w, h) = (s.w, s.h);
+    let row = (w * 4) as usize;
+    let data = row * h as usize;
+    let mut out: Vec<u8> = Vec::with_capacity(54 + data);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + data) as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(data as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+    for y in (0..h).rev() {
+        let p = s.row_ptr(y);
+        let src = unsafe { std::slice::from_raw_parts(p, row) };
+        for x in 0..w as usize {
+            let b = src[x * 4] as u32;
+            let g = src[x * 4 + 1] as u32;
+            let r = src[x * 4 + 2] as u32;
+            let a = src[x * 4 + 3] as u32;
+            let inv = 255 - a;
+            // BMP 的像素顺序是 B,G,R,A
+            out.push(((b + bg.2 as u32 * inv / 255).min(255)) as u8);
+            out.push(((g + bg.1 as u32 * inv / 255).min(255)) as u8);
+            out.push(((r + bg.0 as u32 * inv / 255).min(255)) as u8);
+            out.push(255);
+        }
+    }
+    let _ = std::fs::write(path, out);
+}
+
+/// --shot：把卡片/面板/竖条/设置渲染成图片，不需要窗口和鼠标。
+fn take_shots(dir: &str, scale: f32) -> Result<()> {
+    let renderer = Renderer::new()?;
+    let dpi = 96.0 * scale;
+    let px = |v: f32| (v * scale).round() as i32;
+    std::fs::create_dir_all(dir).ok();
+    let bg = (247u8, 247u8, 248u8);
+    let rows = net::demo_rows();
+    let up: f64 = rows.iter().map(|r| r.up).sum();
+    let down: f64 = rows.iter().map(|r| r.down).sum();
+
+    let cw = px(ui::CARD_W + ui::CARD_MARGIN * 2.0);
+    let ch = px(ui::CARD_H + ui::CARD_MARGIN * 2.0);
+    let card = Surface::new(cw, ch);
+    let t = renderer.target(card.dc, cw, ch, dpi)?;
+    t.begin();
+    ui::draw_card(&t, up, down, 6.0);
+    t.end();
+    save_bmp(&card, &format!("{dir}/card.bmp"), bg);
+
+    let pw = px(ui::PANEL_W);
+    let ph = px(ui::PANEL_H);
+    let panel = Surface::new(pw, ph);
+    let t = renderer.target(panel.dc, pw, ph, dpi)?;
+    t.begin();
+    ui::draw_panel(&t, up, down, &rows, &rows, 6.0, false);
+    t.end();
+    save_bmp(&panel, &format!("{dir}/panel.bmp"), bg);
+
+    let sw = px(ui::SETTINGS_W);
+    let sh = px(ui::SETTINGS_H);
+    let settings = Surface::new(sw, sh);
+    let t = renderer.target(settings.dc, sw, sh, dpi)?;
+    t.begin();
+    ui::draw_settings(&t, false, 252, 6.0, 0);
+    t.end();
+    save_bmp(&settings, &format!("{dir}/settings.bmp"), bg);
+
+    let dw = px(ui::CARD_W + ui::CARD_MARGIN * 2.0);
+    let dh = px(ui::CARD_H + ui::CARD_MARGIN * 2.0);
+    let dock = Surface::new(dw, dh);
+    let t = renderer.target(dock.dc, dw, dh, dpi)?;
+    t.begin();
+    ui::draw_dock(&t, up, down, true, 6.0, 0.0);
+    t.end();
+    save_bmp(&dock, &format!("{dir}/dock.bmp"), bg);
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    if let Some(pos) = std::env::args().position(|a| a == "--shot") {
+        let dir = std::env::args().nth(pos + 1).unwrap_or_else(|| "shots".to_string());
+        let scale: f32 = std::env::args().nth(pos + 2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+        return take_shots(&dir, scale);
+    }
+
     std::panic::set_hook(Box::new(|info| {
         gfx::log(&format!("panic: {info}"));
     }));

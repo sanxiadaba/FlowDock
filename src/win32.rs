@@ -38,6 +38,11 @@ impl Surface {
         }
     }
 
+    /// 第 y 行像素的起始指针（BGRA 预乘），截图用。
+    pub fn row_ptr(&self, y: i32) -> *const u8 {
+        unsafe { (self.bits as *const u8).add((y * self.w * 4) as usize) }
+    }
+
     pub fn present(&self, hwnd: HWND, x: i32, y: i32, alpha: u8) {
         unsafe {
             let pt_dst = POINT { x, y };
