@@ -226,6 +226,16 @@ impl App {
         self.draw_panel();
         unsafe {
             let _ = ShowWindow(self.panel.hwnd, SW_SHOWNOACTIVATE);
+            // ShowWindow 不保证面板回到置顶带顶部：被别的窗口压住时就是“悬停没反应”
+            let _ = SetWindowPos(
+                self.panel.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
             SetTimer(Some(self.card.hwnd), TIMER_FADE, 15, None);
         }
     }
@@ -390,6 +400,15 @@ impl App {
         self.draw_settings();
         unsafe {
             let _ = ShowWindow(self.settings.hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                self.settings.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
         }
     }
 
@@ -454,14 +473,14 @@ fn track_leave(hwnd: HWND) -> bool {
     }
 }
 
-fn tray_menu(hwnd: HWND) -> u32 {
+fn tray_menu(hwnd: HWND, at: (i32, i32)) -> u32 {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return 0 };
         let _ = AppendMenuW(menu, MF_STRING, 1, w!("显示 / 隐藏悬浮窗"));
         let _ = AppendMenuW(menu, MF_STRING, 2, w!("设置…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, 3, w!("退出"));
-        let (cx, cy) = win32::cursor_pos();
+        let (cx, cy) = at;
         let _ = SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, cx, cy, Some(0), hwnd, None).0 as u32;
         let _ = DestroyMenu(menu);
@@ -616,9 +635,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            // 火绒也是右键悬浮窗出菜单，托盘右键同样可用
+            // 火绒也是右键悬浮窗出菜单，托盘右键同样可用。
+            // 菜单挂在卡片下沿之外：卡片是 WS_EX_TOPMOST 而菜单不是，
+            // 从光标位置弹出会被卡片自己压住，“设置…”根本点不到。
             if kind == Some(Kind::Card) {
-                let cmd = tray_menu(hwnd);
+                let at = with_app(|a| (a.card.x, a.card.y + a.card.h + 2))
+                    .unwrap_or_else(win32::cursor_pos);
+                let cmd = tray_menu(hwnd, at);
                 match cmd {
                     1 => {
                         with_app(|a| a.toggle());
@@ -684,7 +707,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let event = (lparam.0 as u32) & 0xFFFF;
             match event {
                 WM_RBUTTONUP => {
-                    let cmd = tray_menu(hwnd);
+                    let cmd = tray_menu(hwnd, win32::cursor_pos());
                     match cmd {
                         1 => {
                             with_app(|a| a.toggle());
