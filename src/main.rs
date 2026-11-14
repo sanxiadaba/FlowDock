@@ -124,7 +124,7 @@ impl App {
     }
 
     fn draw_card(&self) {
-        let (up, down) = self.sampler.totals();
+        let (up, down) = self.sampler.nic_totals();
         self.card.target.begin();
         match self.cfg.dock {
             Dock::None => ui::draw_card(&self.card.target, up, down, self.cfg.radius),

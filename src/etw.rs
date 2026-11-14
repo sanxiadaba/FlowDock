@@ -1,10 +1,18 @@
 //! ETW 逐进程流量采集（Microsoft-Windows-Kernel-Network）。
 //!
 //! 事件 10/16/26/32 是发送，11/17/27/33 是接收；payload 前 8 字节是
-//! `u32 PID` + `u32 size`（TCP/UDP、IPv4/IPv6 都是这个开头）。
-//! 拿不到会话时（例如没有管理员权限）`start()` 返回 false，上层自动退回系统总量。
+//! `u32 PID` + `u32 size`，后面是 `daddr, saddr, dport, sport`（端口和地址都是网络序）。
+//! 拿不到会话时（例如没有管理员权限）`start()` 返回 false，上层自动退回网卡总量。
+//!
+//! 本机到本机的流量（回环、TUN 内部转发、本机网卡自己访问自己）在收发两端各有
+//! 一条事件，直接相加会把同一份字节算两遍、并且把“下载”记成某个进程的“上传”
+//! （代理转发就是这样）。这里用两层过滤去掉重复：
+//! 1. 两端都是本机地址时，只保留“客户端那一份”——进程自己占用的端口不是监听
+//!    端口的就是客户端；服务端那份跳过。
+//! 2. 两端都是本机地址、又都不是监听端口（tun2socks 之类的内部转发）时整条丢弃。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{GUID, PCWSTR, PWSTR};
@@ -29,8 +37,64 @@ pub struct Bytes {
 
 static TOTALS: Mutex<Option<HashMap<u32, Bytes>>> = Mutex::new(None);
 static NAMES: Mutex<Option<HashMap<u32, (String, String, std::time::Instant)>>> = Mutex::new(None);
-static DUMPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static ID_COUNTS: [std::sync::atomic::AtomicU64; 40] = [const { std::sync::atomic::AtomicU64::new(0) }; 40];
+static DUMPED: AtomicU64 = AtomicU64::new(0);
+static ID_COUNTS: [AtomicU64; 40] = [const { AtomicU64::new(0) }; 40];
+
+/// 本机 IPv4 地址（网络序），采样线程每 5 秒刷一次。
+static LOCAL_V4: [AtomicU32; 64] = [const { AtomicU32::new(0) }; 64];
+static LOCAL_V4_LEN: AtomicU32 = AtomicU32::new(0);
+
+/// TCP 监听端口位图（主机序），采样线程每 5 秒刷一次。
+const LISTENER_WORDS: usize = 1024; // 1024 * 64 bit = 65536 个端口
+static LISTENERS: [AtomicU64; LISTENER_WORDS] = [const { AtomicU64::new(0) }; LISTENER_WORDS];
+
+/// 采样线程调用：更新本机地址表。
+pub fn set_local_v4(addrs: &[u32]) {
+    let n = addrs.len().min(LOCAL_V4.len());
+    for (i, a) in addrs.iter().take(n).enumerate() {
+        LOCAL_V4[i].store(*a, Ordering::Relaxed);
+    }
+    for i in n..LOCAL_V4.len() {
+        LOCAL_V4[i].store(0, Ordering::Relaxed);
+    }
+    LOCAL_V4_LEN.store(n as u32, Ordering::Relaxed);
+}
+
+/// 采样线程调用：更新 TCP 监听端口表。
+pub fn set_listeners(ports: &[u16]) {
+    for w in LISTENERS.iter() {
+        w.store(0, Ordering::Relaxed);
+    }
+    for p in ports {
+        let w = (*p / 64) as usize;
+        let b = (*p % 64) as u32;
+        LISTENERS[w].fetch_or(1u64 << b, Ordering::Relaxed);
+    }
+}
+
+fn is_listener(port: u16) -> bool {
+    LISTENERS[(port / 64) as usize].load(Ordering::Relaxed) & (1u64 << (port % 64)) != 0
+}
+
+fn is_local_v4(a: u32) -> bool {
+    if a == 0 {
+        return false;
+    }
+    if (a & 0xFF00_0000) == 0x7F00_0000 {
+        return true; // 127.0.0.0/8，网络序
+    }
+    let n = LOCAL_V4_LEN.load(Ordering::Relaxed) as usize;
+    for i in 0..n {
+        if LOCAL_V4[i].load(Ordering::Relaxed) == a {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_loopback_v6(a: &[u8]) -> bool {
+    a.len() == 16 && a[..15].iter().all(|b| *b == 0) && a[15] == 1
+}
 
 /// 诊断：各事件 ID 的命中次数。
 pub fn id_counts() -> String {
@@ -138,31 +202,75 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     let Some(r) = record.as_ref() else { return };
     let eid = r.EventHeader.EventDescriptor.Id;
     if (eid as usize) < ID_COUNTS.len() {
-        ID_COUNTS[eid as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ID_COUNTS[eid as usize].fetch_add(1, Ordering::Relaxed);
     }
-    let dir_up = match r.EventHeader.EventDescriptor.Id {
-        10 | 16 | 26 | 32 => true,
-        11 | 17 | 27 | 33 => false,
+    // (IPv6?, 发送?)
+    let (v6, dir_up) = match eid {
+        10 => (false, true),
+        11 => (false, false),
+        16 => (false, true),
+        17 => (false, false),
+        26 => (true, true),
+        27 => (true, false),
+        32 => (true, true),
+        33 => (true, false),
         _ => return,
     };
-    if r.UserData.is_null() || (r.UserDataLength as usize) < 8 {
+    if r.UserData.is_null() {
         return;
     }
     let p = r.UserData as *const u8;
     let len = r.UserDataLength as usize;
-    if debug_dump() {
-        let n = DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 400 {
-            let pid = u32::from_le_bytes(std::ptr::read_unaligned(p as *const [u8; 4]));
-            let sz = u32::from_le_bytes(std::ptr::read_unaligned(p.add(4) as *const [u8; 4]));
-            log(&format!("ev id={eid} len={len} pid={pid} size={sz}"));
-        }
+    let need = if v6 { 44 } else { 20 };
+    if len < need {
+        return;
     }
     let pid = u32::from_le_bytes(std::ptr::read_unaligned(p as *const [u8; 4]));
     let size = u32::from_le_bytes(std::ptr::read_unaligned(p.add(4) as *const [u8; 4]));
+    if debug_dump() {
+        let n = DUMPED.fetch_add(1, Ordering::Relaxed);
+        if n < 400 {
+            let hexlen = len.min(48);
+            let raw = std::slice::from_raw_parts(p, hexlen);
+            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+            log(&format!("ev id={eid} len={len} pid={pid} size={size} raw={hex}"));
+        }
+    }
     if pid == 0 || size == 0 {
         return;
     }
+
+    // 地址/端口：网络序（大端）。dport 是目标端口，sport 是源端口。
+    let (daddr_local, saddr_local, dport, sport) = if v6 {
+        let d = std::slice::from_raw_parts(p.add(8), 16);
+        let s = std::slice::from_raw_parts(p.add(24), 16);
+        (
+            is_loopback_v6(d),
+            is_loopback_v6(s),
+            u16::from_be_bytes(std::ptr::read_unaligned(p.add(40) as *const [u8; 2])),
+            u16::from_be_bytes(std::ptr::read_unaligned(p.add(42) as *const [u8; 2])),
+        )
+    } else {
+        (
+            is_local_v4(u32::from_be_bytes(std::ptr::read_unaligned(p.add(8) as *const [u8; 4]))),
+            is_local_v4(u32::from_be_bytes(std::ptr::read_unaligned(p.add(12) as *const [u8; 4]))),
+            u16::from_be_bytes(std::ptr::read_unaligned(p.add(16) as *const [u8; 2])),
+            u16::from_be_bytes(std::ptr::read_unaligned(p.add(18) as *const [u8; 2])),
+        )
+    };
+
+    if daddr_local && saddr_local {
+        // 本机到本机：这条连接的两端各有一次事件，只保留客户端那一份。
+        let own_port = if dir_up { sport } else { dport };
+        let peer_port = if dir_up { dport } else { sport };
+        if is_listener(own_port) {
+            return; // 服务端那份，客户端那边已经计过了
+        }
+        if !is_listener(peer_port) {
+            return; // 两端都不是监听端口：tun2socks 之类的内部转发，不算
+        }
+    }
+
     if let Ok(mut guard) = TOTALS.lock() {
         if let Some(map) = guard.as_mut() {
             let e = map.entry(pid).or_default();

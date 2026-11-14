@@ -1,4 +1,8 @@
-//! 流量采集：有 ETW 时按进程累计并求和；没有 ETW 时退回网卡计数器。
+//! 流量采集：
+//! - 卡片总量（up/down）用物理网卡计数器，代理 / TUN / 回环都不会把方向算错；
+//! - 进程榜用 ETW（Microsoft-Windows-Kernel-Network），本机内部的重复事件在
+//!   `etw::on_event` 里按“本机地址 + 监听端口”去掉；
+//! - 没有管理员权限、ETW 起不来时，卡片照样有网卡总量，只是没有进程榜。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,7 +11,10 @@ use std::thread;
 use std::time::Duration;
 
 use windows::Win32::Foundation::NO_ERROR;
-use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+use windows::Win32::NetworkManagement::IpHelper::{
+    FreeMibTable, GetExtendedTcpTable, GetIfTable2, GetIpAddrTable, MIB_IF_TABLE2,
+    MIB_IPADDRTABLE, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+};
 
 use crate::etw;
 use crate::gfx::log;
@@ -21,10 +28,14 @@ pub struct ProcSample {
 }
 
 pub struct Sampler {
+    /// ETW 各进程之和（面板表头）
     up: AtomicU64,
     down: AtomicU64,
+    /// 物理网卡真实速率（卡片）
+    nic_up: AtomicU64,
+    nic_down: AtomicU64,
     procs: Mutex<Vec<ProcSample>>,
-    /// ETW 和网卡总量都拿不到时，面板要提示需要管理员权限
+    /// ETW 起不来时，面板要提示需要管理员权限
     pub limited: bool,
 }
 
@@ -38,6 +49,8 @@ impl Sampler {
         let s = Arc::new(Sampler {
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
+            nic_up: AtomicU64::new(0),
+            nic_down: AtomicU64::new(0),
             procs: Mutex::new(Vec::new()),
             limited: !etw_ok && !demo,
         });
@@ -48,7 +61,11 @@ impl Sampler {
             let mut recent: HashMap<String, (f64, f64, u64)> = HashMap::new();
             let mut paths: HashMap<String, String> = HashMap::new();
             let mut tick: u64 = 0;
-            let mut prev_totals = if etw_ok { (0, 0) } else { totals() };
+            // 卡片总量永远取物理网卡计数器：代理/TUN/回环都不会把方向算错。
+            let mut prev_totals = totals();
+            if !demo {
+                refresh_net_tables();
+            }
 
             loop {
                 thread::sleep(Duration::from_millis(1000));
@@ -69,13 +86,20 @@ impl Sampler {
                     continue;
                 }
 
+                // 本机地址 / 监听端口每 5 秒刷一次，ETW 回调靠它们去重
+                if tick % 5 == 1 {
+                    refresh_net_tables();
+                }
+                let cur = totals();
+                let nic_up = cur.1.saturating_sub(prev_totals.1);
+                let nic_down = cur.0.saturating_sub(prev_totals.0);
+                c.nic_up.store(nic_up, Ordering::Relaxed);
+                c.nic_down.store(nic_down, Ordering::Relaxed);
+                prev_totals = cur;
+
                 if !etw_ok {
-                    let cur = totals();
-                    let d_in = cur.0.saturating_sub(prev_totals.0) as f64;
-                    let d_out = cur.1.saturating_sub(prev_totals.1) as f64;
-                    c.up.store(d_out as u64, Ordering::Relaxed);
-                    c.down.store(d_in as u64, Ordering::Relaxed);
-                    prev_totals = cur;
+                    c.up.store(nic_up, Ordering::Relaxed);
+                    c.down.store(nic_down, Ordering::Relaxed);
                     continue;
                 }
 
@@ -97,7 +121,7 @@ impl Sampler {
                     paths.entry(name).or_insert(path);
                 }
 
-                // 卡片总量 = 各进程之和，和下面的榜单永远对得上
+                // 面板表头 = 各进程之和；卡片用物理网卡真实速率。
                 c.up.store(total_up as u64, Ordering::Relaxed);
                 c.down.store(total_down as u64, Ordering::Relaxed);
 
@@ -128,9 +152,11 @@ impl Sampler {
                     let su: f64 = list.iter().map(|p| p.up).sum();
                     let sd: f64 = list.iter().map(|p| p.down).sum();
                     log(&format!(
-                        "tick {tick}: sum_up={:.1} sum_down={:.1} kB/s | rows={} | ids={} lost={}",
+                        "tick {tick}: sum_up={:.1} sum_down={:.1} kB/s | nic_up={:.1} nic_down={:.1} | rows={} | ids={} lost={}",
                         total_up / 1024.0,
                         total_down / 1024.0,
+                        nic_up as f64 / 1024.0,
+                        nic_down as f64 / 1024.0,
                         list.len(),
                         etw::id_counts(),
                         etw::events_lost()
@@ -151,10 +177,19 @@ impl Sampler {
         s
     }
 
+    /// 面板表头：各进程的 ETW 归属之和。
     pub fn totals(&self) -> (f64, f64) {
         (
             self.up.load(Ordering::Relaxed) as f64,
             self.down.load(Ordering::Relaxed) as f64,
+        )
+    }
+
+    /// 卡片：物理网卡计数器差值。
+    pub fn nic_totals(&self) -> (f64, f64) {
+        (
+            self.nic_up.load(Ordering::Relaxed) as f64,
+            self.nic_down.load(Ordering::Relaxed) as f64,
         )
     }
 
@@ -165,6 +200,55 @@ impl Sampler {
 
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 const IF_OPER_STATUS_UP: i32 = 1;
+const AF_INET: u32 = 2;
+
+/// 刷新本机 IPv4 地址表和 TCP 监听端口表，供 ETW 回调识别本机内部流量。
+fn refresh_net_tables() {
+    let mut addrs: Vec<u32> = Vec::new();
+    unsafe {
+        let mut size = 0u32;
+        let _ = GetIpAddrTable(None, &mut size, false);
+        if size >= std::mem::size_of::<MIB_IPADDRTABLE>() as u32 {
+            let mut buf = vec![0u8; size as usize];
+            let table = buf.as_mut_ptr() as *mut MIB_IPADDRTABLE;
+            if GetIpAddrTable(Some(table), &mut size, false) == 0 {
+                let n = (*table).dwNumEntries as usize;
+                let rows = (*table).table.as_ptr();
+                for i in 0..n {
+                    addrs.push((*rows.add(i)).dwAddr);
+                }
+            }
+        }
+    }
+    etw::set_local_v4(&addrs);
+
+    let mut ports: Vec<u16> = Vec::new();
+    unsafe {
+        let mut size = 0u32;
+        let _ = GetExtendedTcpTable(None, &mut size, false, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+        if size >= std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>() as u32 {
+            let mut buf = vec![0u8; size as usize];
+            let table = buf.as_mut_ptr() as *mut MIB_TCPTABLE_OWNER_PID;
+            let rc = GetExtendedTcpTable(
+                Some(table as *mut core::ffi::c_void),
+                &mut size,
+                false,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+            if rc == 0 {
+                let n = (*table).dwNumEntries as usize;
+                let rows = (*table).table.as_ptr();
+                for i in 0..n {
+                    let raw = ((*rows.add(i)).dwLocalPort & 0xFFFF) as u16;
+                    ports.push(u16::from_be(raw));
+                }
+            }
+        }
+    }
+    etw::set_listeners(&ports);
+}
 
 fn totals() -> (u64, u64) {
     unsafe {
