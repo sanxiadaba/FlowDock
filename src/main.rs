@@ -346,10 +346,14 @@ impl App {
 
     fn end_drag(&mut self) {
         self.dragging = false;
-        let dock_before = self.cfg.dock;
         unsafe {
             let _ = ReleaseCapture();
         }
+        // 只是点了一下（没拖动）：保持原来的吸附状态，别因为离边缘近就顺手吸过去
+        if self.card.x == self.drag_win.0 && self.card.y == self.drag_win.1 {
+            return;
+        }
+        let dock_before = self.cfg.dock;
         let wa = win32::work_area_at(self.card.x + self.card.w / 2, self.card.y + self.card.h / 2);
         let edge = (28.0 * self.scale()) as i32;
         let right_gap = wa.right - (self.card.x + self.card.w);
