@@ -42,6 +42,7 @@ const TIMER_HIDE: usize = 2;
 const TIMER_FADE: usize = 3;
 const TIMER_REFRESH: usize = 4;
 const TIMER_EXPAND: usize = 5;
+const TIMER_FULLSCREEN: usize = 6;
 
 thread_local! {
     static APP: RefCell<Option<Box<App>>> = const { RefCell::new(None) };
@@ -96,6 +97,10 @@ struct App {
     pinned: bool,
     click_start: (i32, i32),
     tray_icon: HICON,
+    /// 前台全屏应用检测：进入/退出全屏时自动收起/恢复悬浮窗
+    fs_active: bool,
+    fs_hidden: bool,
+    user_hidden: bool,
 }
 
 impl App {
@@ -316,7 +321,7 @@ impl App {
         let mut dock_changed = false;
         if self.cfg.dock != Dock::None {
             let wa = win32::work_area_at(cx, cy);
-            let edge = (24.0 * self.scale()) as i32;
+            let edge = (36.0 * self.scale()) as i32;
             let far_from_right = wa.right - (nx + self.card.w) > edge;
             let far_from_left = nx - wa.left > edge;
             if far_from_right && far_from_left {
@@ -346,7 +351,7 @@ impl App {
             let _ = ReleaseCapture();
         }
         let wa = win32::work_area_at(self.card.x + self.card.w / 2, self.card.y + self.card.h / 2);
-        let edge = (20.0 * self.scale()) as i32;
+        let edge = (28.0 * self.scale()) as i32;
         let right_gap = wa.right - (self.card.x + self.card.w);
         let left_gap = self.card.x - wa.left;
 
@@ -385,9 +390,45 @@ impl App {
                 let _ = ShowWindow(self.card.hwnd, SW_HIDE);
                 self.pinned = false;
                 self.hide_panel();
+                self.user_hidden = true;
             } else {
                 let _ = ShowWindow(self.card.hwnd, SW_SHOWNOACTIVATE);
                 self.draw_card();
+                self.user_hidden = false;
+            }
+        }
+    }
+
+    /// 全屏应用在前台时收起悬浮窗（进全屏时收起，退出全屏时恢复）。
+    fn tick_fullscreen(&mut self) {
+        let fs = win32::foreground_fullscreen(&[self.card.hwnd, self.panel.hwnd, self.settings.hwnd]);
+        if fs && !self.fs_active {
+            self.fs_active = true;
+            self.pinned = false;
+            self.panel_shown = false;
+            self.panel_alpha = 0.0;
+            self.panel_target = 0.0;
+            unsafe {
+                let _ = KillTimer(Some(self.card.hwnd), TIMER_FADE);
+                let _ = ShowWindow(self.panel.hwnd, SW_HIDE);
+            }
+            let visible = unsafe { IsWindowVisible(self.card.hwnd).as_bool() };
+            if visible {
+                unsafe {
+                    let _ = ShowWindow(self.card.hwnd, SW_HIDE);
+                }
+                self.fs_hidden = true;
+            }
+        } else if !fs && self.fs_active {
+            self.fs_active = false;
+            if self.fs_hidden {
+                self.fs_hidden = false;
+                if !self.user_hidden {
+                    unsafe {
+                        let _ = ShowWindow(self.card.hwnd, SW_SHOWNOACTIVATE);
+                    }
+                    self.draw_card();
+                }
             }
         }
     }
@@ -687,6 +728,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = KillTimer(Some(a.card.hwnd), TIMER_FADE);
                     }
                 }),
+                TIMER_FULLSCREEN => with_app(|a| a.tick_fullscreen()),
                 TIMER_REFRESH => with_app(|a| {
                     if IsWindowVisible(a.card.hwnd).as_bool() {
                         a.draw_card();
@@ -732,6 +774,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = BeginPaint(hwnd, &mut ps);
                 let _ = EndPaint(hwnd, &ps);
             }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            // 全屏游戏改分辨率 / 任务栏挪位置后，贴边的卡片要重新贴回边缘
+            with_app(|a| {
+                let wa = win32::work_area_at(a.card.x + a.card.w / 2, a.card.y + a.card.h / 2);
+                match a.cfg.dock {
+                    Dock::Right => a.card.x = wa.right - a.card.w,
+                    Dock::Left => a.card.x = wa.left,
+                    Dock::None => {
+                        a.card.x = a.card.x.clamp(wa.left, (wa.right - a.card.w).max(wa.left));
+                    }
+                }
+                a.card.y = a.card.y.clamp(wa.top, (wa.bottom - a.card.h).max(wa.top));
+                a.cfg.x = Some(a.card.x);
+                a.cfg.y = Some(a.card.y);
+                a.cfg.save();
+                if IsWindowVisible(a.card.hwnd).as_bool() {
+                    a.draw_card();
+                }
+                gfx::log(&format!(
+                    "display change: dock={:?} card={},{}",
+                    a.cfg.dock, a.card.x, a.card.y
+                ));
+            });
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -977,6 +1044,9 @@ fn main() -> Result<()> {
         pinned: false,
         click_start: (0, 0),
         tray_icon,
+        fs_active: false,
+        fs_hidden: false,
+        user_hidden: false,
     };
 
     APP.with(|cell| *cell.borrow_mut() = Some(Box::new(app)));
@@ -985,6 +1055,7 @@ fn main() -> Result<()> {
         unsafe {
             let _ = ShowWindow(a.card.hwnd, SW_SHOWNOACTIVATE);
             SetTimer(Some(a.card.hwnd), TIMER_REFRESH, 1000, None);
+            SetTimer(Some(a.card.hwnd), TIMER_FULLSCREEN, 400, None);
         }
         if std::env::args().any(|arg| arg == "--settings") {
             a.open_settings();

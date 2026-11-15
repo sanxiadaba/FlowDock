@@ -4,9 +4,71 @@ use std::ffi::c_void;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::Shell::{
+    SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_TRAY: u32 = WM_APP + 1;
+
+/// 前台是不是全屏应用（游戏 / 播放器 / 演示），是的话悬浮窗要自动藏起来。
+///
+/// 两条判据：系统的免打扰状态（`SHQueryUserNotificationState`，Windows 自己就用它
+/// 判断“现在别弹通知”），以及前台窗口是否铺满它所在的显示器。
+pub fn foreground_fullscreen(own: &[HWND]) -> bool {
+    unsafe {
+        if let Ok(state) = SHQueryUserNotificationState() {
+            if state == QUNS_BUSY
+                || state == QUNS_RUNNING_D3D_FULL_SCREEN
+                || state == QUNS_PRESENTATION_MODE
+            {
+                return true;
+            }
+        }
+
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || own.contains(&fg) {
+            return false;
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(fg, &mut cls);
+        let class = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+        // 桌面 / 任务栏 / 锁屏之类不算
+        if matches!(
+            class.as_str(),
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+                | "Windows.UI.Core.CoreWindow" | "LockScreen"
+        ) {
+            return false;
+        }
+        if IsIconic(fg).as_bool() {
+            return false;
+        }
+        // 最大化的普通窗口不算（它底下还看得见任务栏）
+        let style = GetWindowLongW(fg, GWL_STYLE) as u32;
+        if style & WS_MAXIMIZE.0 != 0 {
+            return false;
+        }
+        let mut wr = RECT::default();
+        if GetWindowRect(fg, &mut wr).is_err() {
+            return false;
+        }
+        let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        let tol = 2;
+        wr.left <= m.left + tol
+            && wr.top <= m.top + tol
+            && wr.right >= m.right - tol
+            && wr.bottom >= m.bottom - tol
+    }
+}
 
 /// 一块 32bpp 预乘 ARGB 的 DIB 表面，配合 UpdateLayeredWindow 实现圆角+阴影。
 pub struct Surface {
